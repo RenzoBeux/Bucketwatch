@@ -26,11 +26,20 @@ extension PairState {
 extension PairStatus {
     var percent: Int? { progress.map { Int(($0 * 100).rounded(.down)) } }
 
+    var symbol: String {
+        state == .running && activity == .download ? "icloud.and.arrow.down.fill" : state.symbol
+    }
+
+    private var cloudOnlyNote: String? {
+        guard let cloudOnlyFiles, cloudOnlyFiles > 0 else { return nil }
+        return "\(cloudOnlyFiles) only in cloud"
+    }
+
     var summary: String {
         switch state {
         case .unknown: return "Not checked yet"
         case .checking: return "Checking…"
-        case .inSync: return "Up to date"
+        case .inSync: return ["Up to date", cloudOnlyNote].compactMap { $0 }.joined(separator: " · ")
         case .pending:
             var parts: [String] = []
             if pendingFiles > 0 {
@@ -39,17 +48,41 @@ extension PairStatus {
             if remoteOnlyFiles > 0 {
                 parts.append("\(remoteOnlyFiles) to remove from bucket")
             }
+            if let cloudOnlyNote { parts.append(cloudOnlyNote) }
             return parts.isEmpty ? "Changes pending" : parts.joined(separator: " · ")
         case .running:
-            if let percent { return "Uploading · \(percent)%" }
-            return "Preparing upload…"
+            switch activity ?? .upload {
+            case .upload:
+                if let percent { return "Uploading · \(percent)%" }
+                return "Preparing upload…"
+            case .download:
+                if let percent { return "Downloading · \(percent)%" }
+                return "Preparing download…"
+            case .delete:
+                if let percent { return "Removing from bucket · \(percent)%" }
+                return "Removing from bucket…"
+            case .purge:
+                if let percent { return "Deleting old hidden files · \(percent)%" }
+                return "Deleting old hidden files…"
+            }
         case .error:
             return message ?? "Something went wrong"
         }
     }
 
+    /// The cleanup suggestion, e.g. "12 deleted files · 8,4 GB still stored on B2". nil when there's none.
+    var hiddenSuggestion: String? {
+        guard let count = oldHiddenFiles, count > 0 else { return nil }
+        let size = (oldHiddenBytes ?? 0) > 0 ? " · \(Fmt.bytes(oldHiddenBytes ?? 0))" : ""
+        return "\(count == 1 ? "1 deleted file" : "\(count) deleted files")\(size) still stored on B2"
+    }
+
     var progressDetail: String? {
-        guard state == .running, let done = bytesDone, let total = bytesTotal, total > 0 else { return nil }
+        guard state == .running else { return nil }
+        if activity == .delete || activity == .purge, let done = itemsDone, let total = itemsTotal {
+            return "\(done) of \(Fmt.files(total))"
+        }
+        guard let done = bytesDone, let total = bytesTotal, total > 0 else { return nil }
         var text = "\(Fmt.bytes(done)) of \(Fmt.bytes(total))"
         if let speed, speed > 0 { text += " · \(Fmt.speed(speed))" }
         if let eta, eta > 0 { text += " · \(Fmt.duration(eta)) left" }
@@ -58,12 +91,26 @@ extension PairStatus {
 }
 
 extension Snapshot {
+    private var runningActivity: PairActivity? {
+        pairs.first { $0.state == .running }.map { $0.activity ?? .upload }
+    }
+
+    var symbol: String {
+        overall == .running && runningActivity == .download ? "icloud.and.arrow.down.fill" : overall.symbol
+    }
+
     var headline: String {
         let pending = pairs.filter { $0.state == .pending }.count
         switch overall {
         case _ where pairs.isEmpty: return "No folders yet"
         case .inSync: return "All backed up"
-        case .running: return "Uploading"
+        case .running:
+            switch runningActivity ?? .upload {
+            case .upload: return "Uploading"
+            case .download: return "Downloading"
+            case .delete: return "Removing files"
+            case .purge: return "Deleting old versions"
+            }
         case .error: return "Needs attention"
         case .pending: return pending == 1 ? "1 folder pending" : "\(pending) folders pending"
         case .checking: return "Checking…"

@@ -21,6 +21,8 @@ final class RcloneCall: @unchecked Sendable {
         if process.isRunning { process.terminate() }
     }
 
+    var isCancelled: Bool { lock.withLock { cancelled } }
+
     func run(binary: String, arguments: [String], environment: [String: String] = [:],
              onStderrLine: ((String) -> Void)? = nil) async -> RcloneResult {
         process.executableURL = URL(fileURLWithPath: binary)
@@ -65,8 +67,16 @@ final class RcloneCall: @unchecked Sendable {
                 }
                 continuation.resume(returning: result)
             }
+            // A call cancelled before it started never starts.
+            if isCancelled {
+                process.terminationHandler = nil
+                continuation.resume(returning: RcloneResult(status: -1, stdout: "", stderr: "", cancelled: true))
+                return
+            }
             do {
                 try process.run()
+                // Cancelled between the check above and the launch: stop it now.
+                if isCancelled { process.terminate() }
             } catch {
                 process.terminationHandler = nil
                 continuation.resume(returning: RcloneResult(status: -1, stdout: "",
@@ -154,20 +164,45 @@ enum Rclone {
             .flatMap { ["--exclude", $0] }
     }
 
+    /// Compares both ways, so Copy pairs also learn which files exist only in the bucket.
     static func checkArguments(_ pair: Pair) -> [String] {
-        var args = ["check", pair.localPath, target(pair), "--size-only", "--combined", "-",
-                    "--fast-list", "--log-level", "ERROR"]
-        if pair.mode == .copy { args.append("--one-way") }
+        ["check", pair.localPath, target(pair), "--size-only", "--combined", "-",
+         "--fast-list", "--log-level", "ERROR"] + filterArgs(pair)
+    }
+
+    /// The check behind a one-off plan: JSON log lines, so every error can be classified.
+    static func planCheckArguments(_ pair: Pair) -> [String] {
+        checkArguments(pair) + ["--use-json-log"]
+    }
+
+    private static let progressArgs = ["--use-json-log", "--log-level", "NOTICE",
+                                       "--stats", "2s", "--stats-log-level", "NOTICE"]
+
+    /// Folder → bucket. `deleting` picks `sync` (mirror) over `copy` (add and update only).
+    static func uploadArguments(_ pair: Pair, deleting: Bool) -> [String] {
+        var args = [deleting ? "sync" : "copy", pair.localPath, target(pair),
+                    "--fast-list", "--check-first", "--transfers", "4"] + progressArgs
+        if pair.destination.kind == .b2 { args += ["--b2-chunk-size", "96M"] }
         return args + filterArgs(pair)
     }
 
-    static func transferArguments(_ pair: Pair) -> [String] {
-        var args = [pair.mode == .copy ? "copy" : "sync", pair.localPath, target(pair),
-                    "--fast-list", "--check-first", "--transfers", "4",
-                    "--use-json-log", "--log-level", "NOTICE",
-                    "--stats", "2s", "--stats-log-level", "NOTICE"]
-        if pair.destination.kind == .b2 { args += ["--b2-chunk-size", "96M"] }
-        return args + filterArgs(pair)
+    /// Bucket → folder, only the files named in `list`. Never overwrites or deletes anything in the folder.
+    static func downloadArguments(_ pair: Pair, list: String) -> [String] {
+        ["copy", target(pair), pair.localPath, "--files-from-raw", list, "--ignore-existing",
+         "--check-first", "--transfers", "4"] + progressArgs
+    }
+
+    /// Removes exactly the files named in `list` from the bucket. `--max-delete` makes rclone stop
+    /// with an error rather than ever delete more than that many files.
+    static func deleteArguments(_ pair: Pair, list: String, count: Int) -> [String] {
+        ["delete", target(pair), "--files-from-raw", list, "--max-delete", String(count),
+         "--use-json-log", "--log-level", "NOTICE", "--stats", "1s", "--stats-log-level", "NOTICE"]
+    }
+
+    /// Every file in the bucket with its size in bytes, one `size<TAB>path` per line.
+    static func remoteSizesArguments(_ pair: Pair) -> [String] {
+        ["lsf", target(pair), "-R", "--files-only", "--format", "sp", "--separator", "\t",
+         "--fast-list", "--log-level", "ERROR"] + filterArgs(pair)
     }
 
     // MARK: Overlap detection
@@ -177,6 +212,8 @@ enum Rclone {
     struct Location: Equatable {
         var store: String
         var components: [String]
+        /// For B2: the rclone remote that talks to it (components then start with the bucket).
+        var remote: String? = nil
     }
 
     static func components(_ path: String) -> [String] {
@@ -188,7 +225,8 @@ enum Rclone {
         case .b2:
             let bucket = pair.destination.bucket.trimmingCharacters(in: .whitespaces)
             if bucket.isEmpty { return nil }
-            return Location(store: "b2", components: [bucket] + components(pair.destination.path))
+            return Location(store: "b2", components: [bucket] + components(pair.destination.path),
+                            remote: remoteName(pair))
         case .rcloneRemote:
             if pair.destination.remote.isEmpty { return nil }
             return resolve(pair.destination.remote, components(pair.destination.path), remotes, depth: 0)
@@ -208,7 +246,7 @@ enum Rclone {
             }
             return Location(store: "local", components: components(target) + path)
         case "b2":
-            return Location(store: "b2", components: path)
+            return Location(store: "b2", components: path, remote: name)
         default:
             break
         }
@@ -233,13 +271,17 @@ enum Rclone {
         var differ: [String] = []      // "*" in both, but different
         var remoteOnly: [String] = []  // "-" only in the bucket
         var errors: [String] = []      // "!" could not be read
+        var same = 0                   // "=" identical on both sides
     }
 
     static func parseCombined(_ output: String) -> CheckOutcome {
         var outcome = CheckOutcome()
-        for line in output.split(separator: "\n", omittingEmptySubsequences: true) where line.count > 2 {
-            let path = String(line.dropFirst(2))
+        // Split on "\n" scalars, not Characters: "\r\n" is one Character in Swift. Paths keep their
+        // exact scalars because they are handed back to rclone (never Unicode-normalize them).
+        for line in output.unicodeScalars.split(separator: "\n") where line.count > 2 && line.dropFirst().first == " " {
+            let path = String(String.UnicodeScalarView(line.dropFirst(2)))
             switch line.first {
+            case "=": outcome.same += 1
             case "+": outcome.missing.append(path)
             case "*": outcome.differ.append(path)
             case "-": outcome.remoteOnly.append(path)
@@ -255,6 +297,7 @@ enum Rclone {
         var totalBytes: Int64
         var speed: Double
         var eta: Double?
+        var deletes: Int = 0
     }
 
     /// Parses one `--use-json-log` line into progress stats and/or an error message.
@@ -268,11 +311,51 @@ enum Rclone {
             stats = Stats(bytes: (s["bytes"] as? NSNumber)?.int64Value ?? 0,
                           totalBytes: (s["totalBytes"] as? NSNumber)?.int64Value ?? 0,
                           speed: (s["speed"] as? NSNumber)?.doubleValue ?? 0,
-                          eta: (s["eta"] as? NSNumber)?.doubleValue)
+                          eta: (s["eta"] as? NSNumber)?.doubleValue,
+                          deletes: (s["deletes"] as? NSNumber)?.intValue ?? 0)
         }
         let level = obj["level"] as? String
         let error = (level == "error" || level == "critical") ? (obj["msg"] as? String) : nil
         return (stats, error)
+    }
+
+    /// Problems in a `planCheckArguments` log other than the differences themselves.
+    /// "file not in …" and "sizes differ" are the differences; anything else at error level (a folder
+    /// that couldn't be listed, a network failure) means the comparison is incomplete, and a file
+    /// that wasn't seen would look deleted. Unparseable lines count as problems too.
+    static func unexpectedCheckErrors(_ stderr: String) -> [String] {
+        var problems: [String] = []
+        for line in stderr.split(separator: "\n") {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            if text.isEmpty { continue }
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
+                problems.append(text)
+                continue
+            }
+            let level = obj["level"] as? String ?? ""
+            guard level == "error" || level == "critical" || level == "emergency" || level == "alert" else { continue }
+            let msg = obj["msg"] as? String ?? ""
+            if msg.hasPrefix("file not in ") || msg == "sizes differ" { continue }
+            if msg.range(of: #"^[0-9]+ differences found$"#, options: .regularExpression) != nil { continue }
+            let object = (obj["object"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            problems.append(object.map { "\($0): \(msg)" } ?? msg)
+        }
+        return problems
+    }
+
+    /// Size lookups key on NFC so a name rclone printed in another Unicode form still matches.
+    static func sizeKey(_ path: String) -> String { path.precomposedStringWithCanonicalMapping }
+
+    /// Parses `remoteSizesArguments` output.
+    static func parseSizes(_ output: String) -> [String: Int64] {
+        var sizes: [String: Int64] = [:]
+        for line in output.unicodeScalars.split(separator: "\n") {
+            guard let tab = line.firstIndex(of: "\t"),
+                  let size = Int64(String(String.UnicodeScalarView(line[line.startIndex..<tab]))) else { continue }
+            let path = String(String.UnicodeScalarView(line[line.index(after: tab)...]))
+            sizes[sizeKey(path)] = size
+        }
+        return sizes
     }
 
     /// Last meaningful ERROR line from plain (non-JSON) rclone stderr.

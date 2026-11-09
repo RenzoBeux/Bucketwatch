@@ -66,6 +66,13 @@ enum PairState: String, Codable {
     case unknown, checking, inSync, pending, running, error
 }
 
+/// What a `.running` pair is doing.
+enum PairActivity: String, Codable {
+    case upload, download, delete
+    /// Permanently deleting old hidden versions on B2.
+    case purge
+}
+
 struct PairStatus: Codable, Hashable, Identifiable {
     var id: UUID
     var name: String
@@ -81,6 +88,19 @@ struct PairStatus: Codable, Hashable, Identifiable {
     var speed: Double?
     var eta: Double?
     var message: String?
+    // Optional so status files written by older versions still decode.
+    /// Copy pairs: files that are only in the bucket (kept there on purpose). nil for Sync pairs.
+    var cloudOnlyFiles: Int?
+    /// Set while `.running`; nil means an upload.
+    var activity: PairActivity?
+    /// Progress of a removal, in files.
+    var itemsDone: Int?
+    var itemsTotal: Int?
+    /// B2 pairs: files deleted from the bucket at least 30 days ago that B2 still stores as hidden
+    /// versions. Found by the daily scan; deleting them is only ever suggested.
+    var oldHiddenFiles: Int?
+    var oldHiddenBytes: Int64?
+    var hiddenScanned: Date?
 }
 
 struct Snapshot: Codable {

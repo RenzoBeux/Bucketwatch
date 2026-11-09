@@ -7,7 +7,7 @@ struct MenuView: View {
         let snapshot = model.snapshot
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: snapshot.overall.symbol)
+                Image(systemName: snapshot.symbol)
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(snapshot.overall.tint)
                     .contentTransition(.symbolEffect(.replace))
@@ -72,7 +72,7 @@ private struct PairRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: status.state.symbol)
+            Image(systemName: status.symbol)
                 .font(.system(size: 20, weight: .medium))
                 .foregroundStyle(status.state.tint)
                 .symbolEffect(.pulse, isActive: status.state == .checking || status.state == .running)
@@ -112,6 +112,20 @@ private struct PairRow: View {
                     }
                 } else {
                     footnote
+                    if let suggestion = status.hiddenSuggestion {
+                        Button { HiddenFilesWindow.show(pair.id) } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash.circle")
+                                Text(suggestion)
+                                Text("· Review…").foregroundStyle(.tint)
+                            }
+                            .font(.caption2)
+                            .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("Deleted from the bucket \(HiddenFiles.minimumDays)+ days ago and still billed. Review before anything is deleted.")
+                    }
                 }
             }
 
@@ -125,6 +139,16 @@ private struct PairRow: View {
                     IconButton(symbol: "icloud.and.arrow.up", help: pair.mode == .sync ? "Sync now" : "Back up now",
                                prominent: status.state == .pending) { model.backUp(pair.id) }
                 }
+                Menu { menuItems } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .frame(width: 26, height: 26)
+                .help("More")
             }
         }
         .padding(10)
@@ -133,12 +157,23 @@ private struct PairRow: View {
                 .fill(hovering ? Color.primary.opacity(0.07) : Color.primary.opacity(0.035))
         )
         .onHover { hovering = $0 }
-        .contextMenu {
-            Button("Edit…") { SettingsWindow.show(select: pair.id) }
-            Button("Show in Finder") {
-                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: pair.localPath)
-            }
+        .contextMenu { menuItems }
+    }
+
+    /// The one-off actions only open a review window. Nothing runs from the menu itself.
+    @ViewBuilder private var menuItems: some View {
+        Button("Download from Cloud…") { ReviewWindow.show(pair.id, kind: .download) }
+        if pair.mode == .copy {
+            Button("Sync Once…") { ReviewWindow.show(pair.id, kind: .syncOnce) }
         }
+        if model.supportsHiddenCleanup(pair) {
+            Button("Old Hidden Files…") { HiddenFilesWindow.show(pair.id) }
+        }
+        Divider()
+        Button("Show in Finder") {
+            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: pair.localPath)
+        }
+        Button("Edit…") { SettingsWindow.show(select: pair.id) }
     }
 
     @ViewBuilder private var footnote: some View {

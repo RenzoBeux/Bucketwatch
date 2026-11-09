@@ -37,7 +37,7 @@ final class AppModel: ObservableObject {
         if let snapshot = SharedStore.load() {
             for var status in snapshot.pairs where config.pairs.contains(where: { $0.id == status.id }) {
                 if status.state == .running || status.state == .checking { status.state = .unknown }
-                status.progress = nil
+                AppModel.clearProgress(&status)
                 statuses[status.id] = status
             }
         }
@@ -90,6 +90,12 @@ final class AppModel: ObservableObject {
 
     func isBusy(_ id: UUID) -> Bool { calls[id] != nil }
 
+    private static func clearProgress(_ status: inout PairStatus) {
+        status.progress = nil; status.bytesDone = nil; status.bytesTotal = nil
+        status.speed = nil; status.eta = nil
+        status.activity = nil; status.itemsDone = nil; status.itemsTotal = nil
+    }
+
     private func update(_ id: UUID, _ change: (inout PairStatus) -> Void) {
         var status = status(for: id)
         let before = status.state
@@ -116,7 +122,10 @@ final class AppModel: ObservableObject {
         for pair in config.pairs {
             guard let previous = old.pairs.first(where: { $0.id == pair.id }) else { continue }
             if previous.comparisonKey != pair.comparisonKey, !isBusy(pair.id) {
-                update(pair.id) { $0.state = .unknown; $0.lastChecked = nil; $0.message = nil }
+                update(pair.id) { s in
+                    s.state = .unknown; s.lastChecked = nil; s.message = nil; s.cloudOnlyFiles = nil
+                    s.oldHiddenFiles = nil; s.oldHiddenBytes = nil; s.hiddenScanned = nil
+                }
             }
         }
         publish(force: true)
@@ -168,7 +177,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func validate(_ pair: Pair) -> String? {
+    /// rclone's remotes, for resolving aliases (refreshed at most every 5 minutes).
+    func remotesForPlanning() -> [String: [String: String]] {
+        refreshRemoteConfig()
+        return remoteConfig
+    }
+
+    /// Why this pair can't be checked or transferred right now, or nil.
+    func validate(_ pair: Pair) -> String? {
         if rcloneBinary == nil { return "rclone not found — install it with Homebrew (brew install rclone)" }
         if let other = overlappingPair(for: pair) { return "Destination overlaps with “\(other.name)”" }
         if pair.localPath.isEmpty { return "Choose a local folder" }
@@ -200,7 +216,7 @@ final class AppModel: ObservableObject {
         }
         let call = RcloneCall()
         calls[id] = call
-        update(id) { $0.state = .checking }
+        update(id) { $0.state = .checking; AppModel.clearProgress(&$0) }
 
         Task {
             let result = await call.run(binary: rcloneBinary!, arguments: Rclone.checkArguments(pair),
@@ -233,6 +249,8 @@ final class AppModel: ObservableObject {
             s.pendingFiles = pendingPaths.count
             s.pendingBytes = pendingBytes
             s.remoteOnlyFiles = remoteOnly
+            // Copy pairs keep cloud-only files on purpose: informational, never "pending".
+            s.cloudOnlyFiles = pair.mode == .copy ? outcome.remoteOnly.count : nil
             if !outcome.errors.isEmpty {
                 s.state = .error
                 s.message = "\(Fmt.files(outcome.errors.count)) could not be read"
@@ -263,11 +281,19 @@ final class AppModel: ObservableObject {
             update(id) { $0.state = .error; $0.message = problem }
             return
         }
+        if pair.mode == .sync && LocalProbe.hasNoFiles(URL(fileURLWithPath: pair.localPath)) {
+            update(id) {
+                $0.state = .error
+                $0.message = "The folder is empty, so it wasn't synced (that would empty the bucket)"
+            }
+            return
+        }
         let call = RcloneCall()
         calls[id] = call
         update(id) { s in
             s.state = .running; s.message = nil
-            s.progress = nil; s.bytesDone = nil; s.bytesTotal = nil; s.speed = nil; s.eta = nil
+            AppModel.clearProgress(&s)
+            s.activity = .upload
         }
         let activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated],
                                                              reason: "Bucketwatch is uploading \(pair.name)")
@@ -275,20 +301,20 @@ final class AppModel: ObservableObject {
 
         Task {
             let result = await call.run(
-                binary: rcloneBinary!, arguments: Rclone.transferArguments(pair),
+                binary: rcloneBinary!, arguments: Rclone.uploadArguments(pair, deleting: pair.mode == .sync),
                 environment: Rclone.environment(pair),
                 onStderrLine: { line in
                     let parsed = Rclone.parseLogLine(line)
                     if let message = parsed.error { lastError.set(message) }
                     guard let stats = parsed.stats else { return }
-                    Task { @MainActor in self.applyStats(id, stats) }
+                    Task { @MainActor in self.applyStats(id, stats, for: call) }
                 })
             ProcessInfo.processInfo.endActivity(activity)
             if calls[id] === call { calls[id] = nil }
             guard config.pairs.contains(where: { $0.id == id }) else { return }
 
             update(id) { s in
-                s.progress = nil; s.speed = nil; s.eta = nil
+                AppModel.clearProgress(&s)
                 if result.cancelled {
                     s.state = .pending
                     s.message = "Upload stopped"
@@ -305,19 +331,212 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func applyStats(_ id: UUID, _ stats: Rclone.Stats) {
-        guard isBusy(id), status(for: id).state == .running else { return }
+    private func applyStats(_ id: UUID, _ stats: Rclone.Stats, for call: RcloneCall) {
+        // Ignore late stats from a phase that has already finished.
+        guard calls[id] === call, status(for: id).state == .running else { return }
         var status = status(for: id)
-        status.bytesDone = stats.bytes
-        status.bytesTotal = stats.totalBytes
-        status.progress = stats.totalBytes > 0 ? min(1, Double(stats.bytes) / Double(stats.totalBytes)) : nil
-        status.speed = stats.speed
-        status.eta = stats.eta
+        if status.activity == .delete {
+            let total = status.itemsTotal ?? 0
+            status.itemsDone = min(stats.deletes, total)
+            status.progress = total > 0 ? min(1, Double(stats.deletes) / Double(total)) : nil
+        } else {
+            status.bytesDone = stats.bytes
+            status.bytesTotal = stats.totalBytes
+            status.progress = stats.totalBytes > 0 ? min(1, Double(stats.bytes) / Double(stats.totalBytes)) : nil
+            status.speed = stats.speed
+            status.eta = stats.eta
+        }
         statuses[id] = status
         publish()
     }
 
     func stop(_ id: UUID) { calls[id]?.cancel() }
+
+    // MARK: One-off download / sync
+
+    /// Why a reviewed plan can't start right now, or nil.
+    func planBlocker(_ plan: TransferPlan, acknowledged: Bool) -> String? {
+        guard let pair = config.pairs.first(where: { $0.id == plan.pair.id }) else {
+            return "This folder is no longer in Bucketwatch."
+        }
+        if pair.comparisonKey != plan.pair.comparisonKey {
+            return "The folder's settings changed since this preview. Refresh it."
+        }
+        if isBusy(pair.id) { return "“\(pair.name)” is busy. Wait until it finishes." }
+        if Date().timeIntervalSince(plan.created) > 30 * 60 {
+            return "This preview is more than 30 minutes old. Refresh it."
+        }
+        if plan.removesMostOfBucket && !acknowledged {
+            return "Confirm that you want to remove most of the bucket."
+        }
+        if let problem = validate(pair) { return problem }
+        if plan.kind == .download {
+            var now = plan
+            now.freeBytes = LocalProbe.freeSpace(URL(fileURLWithPath: pair.localPath))
+            if now.spaceShortfall != nil { return "Not enough free space on the folder's disk." }
+        }
+        return nil
+    }
+
+    /// Starts a plan the user reviewed and confirmed. Returns why it couldn't start, or nil.
+    func start(_ plan: TransferPlan, acknowledged: Bool) -> String? {
+        if let blocker = planBlocker(plan, acknowledged: acknowledged) { return blocker }
+        guard let pair = config.pairs.first(where: { $0.id == plan.pair.id }), let binary = rcloneBinary else {
+            return "rclone not found"
+        }
+        switch plan.kind {
+        case .download: return startDownload(plan, pair: pair, binary: binary)
+        case .syncOnce: startSyncOnce(plan, pair: pair, binary: binary); return nil
+        }
+    }
+
+    private func startDownload(_ plan: TransferPlan, pair: Pair, binary: String) -> String? {
+        let id = pair.id
+        let list: URL
+        do { list = try PlanFiles.write(plan.cloudOnly.map(\.path)) } catch { return error.localizedDescription }
+        let call = RcloneCall()
+        calls[id] = call
+        update(id) { s in
+            s.state = .running; s.message = nil
+            AppModel.clearProgress(&s)
+            s.activity = .download
+        }
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated],
+                                                             reason: "Bucketwatch is downloading \(pair.name)")
+        Task {
+            let outcome = await runTransfer(call, id: id, binary: binary,
+                                            arguments: Rclone.downloadArguments(pair, list: list.path),
+                                            environment: Rclone.environment(pair))
+            ProcessInfo.processInfo.endActivity(activity)
+            try? FileManager.default.removeItem(at: list)
+            finishOneOff(id, call, error: outcome.ok || outcome.cancelled ? nil : "Download failed: \(outcome.error)")
+        }
+        return nil
+    }
+
+    /// Upload first (copy, never deletes); only if that fully succeeds, remove the reviewed files that are
+    /// still missing from the folder, and nothing else.
+    private func startSyncOnce(_ plan: TransferPlan, pair: Pair, binary: String) {
+        let id = pair.id
+        let environment = Rclone.environment(pair)
+        let root = URL(fileURLWithPath: pair.localPath)
+        // Holding a call for the whole run keeps checks and scheduled uploads away from this pair.
+        let upload = RcloneCall()
+        calls[id] = upload
+        update(id) { s in
+            s.state = .running; s.message = nil
+            AppModel.clearProgress(&s)
+            s.activity = .upload
+        }
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated],
+                                                             reason: "Bucketwatch is syncing \(pair.name)")
+        Task {
+            defer { ProcessInfo.processInfo.endActivity(activity) }
+
+            if !plan.toUpload.isEmpty {
+                let outcome = await runTransfer(upload, id: id, binary: binary,
+                                                arguments: Rclone.uploadArguments(pair, deleting: false),
+                                                environment: environment)
+                if !outcome.ok {
+                    finishOneOff(id, upload, error: outcome.cancelled ? nil
+                                 : "Upload failed, so nothing was removed from the bucket: \(outcome.error)")
+                    return
+                }
+                update(id) { $0.lastRun = .now }
+            }
+            // Stopped, or removed from Bucketwatch, before the removal started.
+            guard !upload.isCancelled, calls[id] === upload,
+                  let current = config.pairs.first(where: { $0.id == id }) else {
+                finishOneOff(id, upload, error: nil)
+                return
+            }
+            if current.comparisonKey != plan.pair.comparisonKey {
+                finishOneOff(id, upload, error: "Settings changed during the sync, so nothing was removed from the bucket")
+                return
+            }
+            if let problem = validate(current) {
+                finishOneOff(id, upload, error: "\(problem). Nothing was removed from the bucket")
+                return
+            }
+            let toRemove: [String]
+            let list: URL
+            do {
+                // A file restored since the review stays in the bucket.
+                toRemove = try LocalProbe.stillMissing(plan.cloudOnly.map(\.path), under: root)
+                if toRemove.isEmpty {
+                    finishOneOff(id, upload, error: nil)
+                    return
+                }
+                list = try PlanFiles.write(toRemove)
+            } catch {
+                finishOneOff(id, upload, error: error.localizedDescription)
+                return
+            }
+
+            let remover = RcloneCall()
+            calls[id] = remover
+            update(id) { s in
+                AppModel.clearProgress(&s)
+                s.activity = .delete
+                s.itemsTotal = toRemove.count
+                s.itemsDone = 0
+                s.progress = 0
+            }
+            let outcome = await runTransfer(remover, id: id, binary: binary,
+                                            arguments: Rclone.deleteArguments(pair, list: list.path, count: toRemove.count),
+                                            environment: environment)
+            try? FileManager.default.removeItem(at: list)
+            let removed = outcome.lastStats?.deletes ?? 0
+            finishOneOff(id, remover, error: outcome.ok || outcome.cancelled ? nil
+                         : "Removed \(removed) of \(Fmt.files(toRemove.count)) from the bucket, then rclone failed: \(outcome.error)")
+        }
+    }
+
+    private struct TransferOutcome {
+        var ok: Bool
+        var cancelled: Bool
+        var error: String
+        var lastStats: Rclone.Stats?
+    }
+
+    private func runTransfer(_ call: RcloneCall, id: UUID, binary: String, arguments: [String],
+                             environment: [String: String]) async -> TransferOutcome {
+        let lastError = LastValue()
+        let result = await call.run(
+            binary: binary, arguments: arguments, environment: environment,
+            onStderrLine: { line in
+                let parsed = Rclone.parseLogLine(line)
+                if let message = parsed.error { lastError.set(message) }
+                guard let stats = parsed.stats else { return }
+                Task { @MainActor in self.applyStats(id, stats, for: call) }
+            })
+        let lastStats = result.stderr.split(separator: "\n").reversed()
+            .lazy.compactMap { Rclone.parseLogLine(String($0)).stats }.first
+        return TransferOutcome(ok: !result.cancelled && result.status == 0, cancelled: result.cancelled,
+                               error: lastError.get() ?? Rclone.lastError(in: result.stderr)
+                                   ?? "rclone exited with code \(result.status)",
+                               lastStats: lastStats)
+    }
+
+    /// Ends a one-off. Success or a stop runs a fresh check so the row shows the real state; a failure
+    /// leaves its message visible.
+    private func finishOneOff(_ id: UUID, _ call: RcloneCall, error: String?) {
+        if calls[id] === call { calls[id] = nil }
+        guard config.pairs.contains(where: { $0.id == id }) else { return }
+        if let error {
+            update(id) { s in
+                AppModel.clearProgress(&s)
+                s.state = .error
+                s.message = error
+            }
+        } else {
+            update(id) { s in
+                AppModel.clearProgress(&s)
+                s.state = .unknown
+            }
+            check(id)
+        }
+    }
 
     // MARK: Scheduler
 
@@ -369,6 +588,128 @@ final class AppModel: ObservableObject {
             }
             if checkAge >= Double(pair.checkEveryMinutes) * 60 { check(pair.id) }
         }
+        for pair in config.pairs where pair.enabled && hiddenScanIsDue(pair, now: now) {
+            scanHidden(pair.id)
+        }
+    }
+
+    // MARK: Old hidden files (B2)
+
+    private var hiddenScans: [UUID: Task<Void, Never>] = [:]
+    private var hiddenScanAttempts: [UUID: Date] = [:]
+
+    /// The pair's B2 bucket, folder and key. nil when the pair isn't on B2.
+    func hiddenTarget(_ pair: Pair) throws -> B2Target? {
+        try B2Target.resolve(pair, remotes: remotesForPlanning())
+    }
+
+    /// Whether the pair is on B2 (no Keychain access, so views can ask).
+    func supportsHiddenCleanup(_ pair: Pair) -> Bool {
+        Rclone.location(pair, remotes: remotesForPlanning())?.store == "b2"
+    }
+
+    /// Once a day per B2 pair, retried at most hourly when it fails, and never on a metered network.
+    private func hiddenScanIsDue(_ pair: Pair, now: Date) -> Bool {
+        guard hiddenScans[pair.id] == nil, supportsHiddenCleanup(pair) else { return false }
+        if pair.schedule.skipExpensiveNetwork && networkIsExpensive { return false }
+        if let attempt = hiddenScanAttempts[pair.id], now.timeIntervalSince(attempt) < 3600 { return false }
+        guard let scanned = status(for: pair.id).hiddenScanned else { return true }
+        return now.timeIntervalSince(scanned) >= 86_400
+    }
+
+    /// Read-only: counts the files that have been hidden on B2 for at least 30 days, for the suggestion.
+    func scanHidden(_ id: UUID) {
+        guard hiddenScans[id] == nil, let pair = config.pairs.first(where: { $0.id == id }),
+              let target = try? hiddenTarget(pair) else { return }
+        hiddenScanAttempts[id] = .now
+        hiddenScans[id] = Task {
+            defer { hiddenScans[id] = nil }
+            let client = B2Client(target.credentials)
+            guard let plan = try? await HiddenScanner.plan(pair: pair, target: target, client: client,
+                                                           strictLocal: false) else { return }
+            recordHiddenScan(plan)
+        }
+    }
+
+    /// A fresh review is a scan too: keep the menu's suggestion in line with it.
+    func recordHiddenScan(_ plan: HiddenPlan) {
+        guard let pair = config.pairs.first(where: { $0.id == plan.pair.id }),
+              pair.comparisonKey == plan.pair.comparisonKey else { return }
+        update(pair.id) { s in
+            s.oldHiddenFiles = plan.old.count
+            s.oldHiddenBytes = plan.oldBytes
+            s.hiddenScanned = .now
+        }
+    }
+
+    /// Why a reviewed cleanup can't start right now, or nil.
+    func purgeBlocker(_ plan: HiddenPlan) -> String? {
+        guard let pair = config.pairs.first(where: { $0.id == plan.pair.id }) else {
+            return "This folder is no longer in Bucketwatch."
+        }
+        if pair.comparisonKey != plan.pair.comparisonKey {
+            return "The folder's settings changed since this review. Refresh it."
+        }
+        if isBusy(pair.id) { return "“\(pair.name)” is busy. Wait until it finishes." }
+        if Date().timeIntervalSince(plan.created) > 30 * 60 {
+            return "This review is more than 30 minutes old. Refresh it."
+        }
+        if plan.old.isEmpty { return "There's nothing to delete." }
+        return nil
+    }
+
+    /// Permanently deletes the reviewed old hidden files. Returns why it couldn't start, or nil.
+    func startPurge(_ plan: HiddenPlan) -> String? {
+        if let blocker = purgeBlocker(plan) { return blocker }
+        guard let pair = config.pairs.first(where: { $0.id == plan.pair.id }) else { return "Folder not found" }
+        let target: B2Target
+        do {
+            guard let resolved = try hiddenTarget(pair) else { return "This folder isn't on B2." }
+            target = resolved
+        } catch {
+            return error.localizedDescription
+        }
+        guard target.bucket == plan.bucket, target.prefix == plan.prefix else {
+            return "The folder's destination changed since this review. Refresh it."
+        }
+        let id = pair.id
+        let total = plan.old.count
+        // Never runs a process: it holds the pair (no checks or uploads meanwhile) and carries Stop.
+        let token = RcloneCall()
+        calls[id] = token
+        update(id) { s in
+            s.state = .running; s.message = nil
+            AppModel.clearProgress(&s)
+            s.activity = .purge
+            s.itemsTotal = total
+            s.itemsDone = 0
+            s.progress = 0
+        }
+        Task {
+            let client = B2Client(target.credentials)
+            let report = await HiddenPurger.run(
+                plan, target: target, client: client,
+                shouldStop: { token.isCancelled },
+                progress: { done in
+                    Task { @MainActor in
+                        guard self.calls[id] === token else { return }
+                        self.update(id) { s in
+                            s.itemsDone = done
+                            s.progress = min(1, Double(done) / Double(max(total, 1)))
+                        }
+                    }
+                })
+            update(id) { s in
+                s.oldHiddenFiles = max(0, (s.oldHiddenFiles ?? total) - report.deleted)
+                s.oldHiddenBytes = max(0, (s.oldHiddenBytes ?? 0) - report.deletedBytes)
+            }
+            finishOneOff(id, token, error: report.error.map {
+                "Deleted \(report.deleted) of \(Fmt.files(total)) for good, then stopped. \($0)"
+            })
+            hiddenScanAttempts[id] = nil
+            scanHidden(id)
+        }
+        return nil
     }
 
     // MARK: Misc
@@ -416,6 +757,10 @@ final class AppModel: ObservableObject {
         switch url.host {
         case "run": if let id { backUp(id) }
         case "check": if let id { check(id) } else { checkAll() }
+        // These only open the review window. Nothing runs until the user confirms there.
+        case "download": if let id { ReviewWindow.show(id, kind: .download) }
+        case "sync-once": if let id { ReviewWindow.show(id, kind: .syncOnce) }
+        case "hidden": if let id { HiddenFilesWindow.show(id) }
         default: SettingsWindow.show(select: id)
         }
     }

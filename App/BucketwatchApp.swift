@@ -10,7 +10,7 @@ struct BucketwatchApp: App {
         MenuBarExtra {
             MenuView(model: model)
         } label: {
-            Image(systemName: model.overallState.symbol)
+            Image(systemName: model.snapshot.symbol)
                 .accessibilityLabel("Bucketwatch")
         }
         .menuBarExtraStyle(.window)

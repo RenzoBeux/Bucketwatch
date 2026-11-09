@@ -57,7 +57,7 @@ struct StatusWidgetView: View {
     private var small: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .top) {
-                Image(systemName: snapshot.overall.symbol)
+                Image(systemName: snapshot.symbol)
                     .font(.system(size: 30, weight: .semibold))
                     .foregroundStyle(snapshot.overall.tint)
                     .widgetAccentable()
@@ -86,7 +86,7 @@ struct StatusWidgetView: View {
     private func list(limit: Int) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Image(systemName: snapshot.overall.symbol)
+                Image(systemName: snapshot.symbol)
                     .foregroundStyle(snapshot.overall.tint)
                     .widgetAccentable()
                 Text(snapshot.headline).font(.system(.headline, design: .rounded))
@@ -126,7 +126,7 @@ private struct Row: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: status.state.symbol)
+            Image(systemName: status.symbol)
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(status.state.tint)
                 .widgetAccentable()
