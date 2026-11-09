@@ -5,12 +5,17 @@ import SwiftUI
 enum SettingsWindow {
     private static var window: NSWindow?
 
+    static func showDashboard() {
+        AppModel.shared.selection = .dashboard
+        show()
+    }
+
     static func show(select id: UUID? = nil) {
         let model = AppModel.shared
         if let id, model.config.pairs.contains(where: { $0.id == id }) {
             model.selection = .pair(id)
         } else if model.selection == nil {
-            model.selection = model.config.pairs.first.map { .pair($0.id) } ?? .general
+            model.selection = .dashboard
         }
         if window == nil {
             let host = NSHostingController(rootView: SettingsView(model: model))
@@ -36,6 +41,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationSplitView {
             List(selection: $model.selection) {
+                Label("Dashboard", systemImage: "square.grid.2x2").tag(SidebarItem.dashboard)
                 Section("Folders") {
                     ForEach(model.config.pairs) { pair in
                         let state = model.status(for: pair.id).state
@@ -71,6 +77,8 @@ struct SettingsView: View {
             .navigationSplitViewColumnWidth(min: 190, ideal: 210)
         } detail: {
             switch model.selection {
+            case .dashboard:
+                DashboardView(model: model)
             case .pair(let id):
                 if let binding = model.binding(for: id) {
                     PairEditor(pair: binding, model: model).id(id)
@@ -117,6 +125,8 @@ private struct PairEditor: View {
 
     var body: some View {
         Form {
+            actions
+
             Section("Folder") {
                 TextField("Name", text: $pair.name)
                 LabeledContent("Local folder") {
@@ -250,6 +260,7 @@ private struct PairEditor: View {
             }
         }
         .formStyle(.grouped)
+        .navigationTitle(pair.name.isEmpty ? "Folder" : pair.name)
         .onAppear {
             appKey = Keychain.get(pair.id.uuidString) ?? ""
             excludesText = pair.excludes.joined(separator: "\n")
@@ -267,6 +278,70 @@ private struct PairEditor: View {
         } message: {
             Text("Bucketwatch stops watching this folder. Nothing is deleted from the folder or the bucket."
                  + (pair.destination.kind == .b2 ? " Its B2 application key is removed from the Keychain." : ""))
+        }
+    }
+
+    // MARK: Actions
+
+    @ViewBuilder private var actions: some View {
+        let status = model.status(for: pair.id)
+        let busy = model.isBusy(pair.id)
+        Section {
+            LabeledContent {
+                HStack(spacing: 8) {
+                    if busy {
+                        Button("Stop") { model.stop(pair.id) }
+                    } else {
+                        Button("Check Now") { model.check(pair.id) }
+                        Button(pair.mode == .sync ? "Sync Now" : "Back Up Now") { model.backUp(pair.id) }
+                    }
+                }
+            } label: {
+                Label {
+                    Text(status.summary)
+                        .foregroundStyle(status.state == .error ? AnyShapeStyle(.red) : AnyShapeStyle(.primary))
+                } icon: {
+                    Image(systemName: status.symbol).foregroundStyle(status.state.tint)
+                }
+            }
+            actionRow("Download from Cloud…", symbol: "icloud.and.arrow.down",
+                      detail: "Copies the files that are only in the bucket into this folder, so you can review them.") {
+                ReviewWindow.show(pair.id, kind: .download)
+            }
+            if pair.mode == .copy {
+                actionRow("Sync Once…", symbol: "arrow.triangle.2.circlepath.icloud",
+                          detail: "Removes from the bucket the files you deleted here, this one time. The folder stays in Copy mode.") {
+                    ReviewWindow.show(pair.id, kind: .syncOnce)
+                }
+            }
+            if model.supportsHiddenCleanup(pair) {
+                actionRow("Old Hidden Files…", symbol: "trash.circle",
+                          detail: status.hiddenSuggestion
+                              ?? "Files deleted from B2 at least \(HiddenFiles.minimumDays) days ago that still use storage. None right now.") {
+                    HiddenFilesWindow.show(pair.id)
+                }
+            }
+        } header: {
+            Text("Actions")
+        } footer: {
+            Text("Each action opens a review first. Nothing changes until you confirm.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .disabled(pair.localPath.isEmpty)
+    }
+
+    private func actionRow(_ title: String, symbol: String, detail: String,
+                           action: @escaping () -> Void) -> some View {
+        LabeledContent {
+            Button(title, action: action)
+                .disabled(model.isBusy(pair.id))
+        } label: {
+            Label {
+                Text(detail).font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: symbol).foregroundStyle(.tint)
+            }
         }
     }
 
@@ -345,6 +420,7 @@ private struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
+        .navigationTitle("General")
         .onAppear { version = model.rcloneVersion() }
         .onChange(of: model.config.rclonePath) { _, _ in version = model.rcloneVersion() }
     }

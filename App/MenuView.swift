@@ -47,7 +47,9 @@ struct MenuView: View {
 
             Divider()
 
-            HStack {
+            HStack(spacing: 14) {
+                Button("Dashboard") { SettingsWindow.showDashboard() }
+                    .keyboardShortcut("d")
                 Button("Settings…") { SettingsWindow.show() }
                     .keyboardShortcut(",")
                 Spacer()
@@ -160,21 +162,7 @@ private struct PairRow: View {
         .contextMenu { menuItems }
     }
 
-    /// The one-off actions only open a review window. Nothing runs from the menu itself.
-    @ViewBuilder private var menuItems: some View {
-        Button("Download from Cloud…") { ReviewWindow.show(pair.id, kind: .download) }
-        if pair.mode == .copy {
-            Button("Sync Once…") { ReviewWindow.show(pair.id, kind: .syncOnce) }
-        }
-        if model.supportsHiddenCleanup(pair) {
-            Button("Old Hidden Files…") { HiddenFilesWindow.show(pair.id) }
-        }
-        Divider()
-        Button("Show in Finder") {
-            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: pair.localPath)
-        }
-        Button("Edit…") { SettingsWindow.show(select: pair.id) }
-    }
+    private var menuItems: some View { PairActionItems(pair: pair, model: model) }
 
     @ViewBuilder private var footnote: some View {
         HStack(spacing: 4) {
@@ -211,5 +199,30 @@ struct IconButton: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .help(help)
+    }
+}
+
+/// A pair's one-off actions, shared by the menu bar, the dashboard and the context menus.
+/// They only open a review window: nothing runs from the menu itself.
+struct PairActionItems: View {
+    let pair: Pair
+    let model: AppModel
+    var showsEdit = true
+
+    var body: some View {
+        Button("Download from Cloud…") { ReviewWindow.show(pair.id, kind: .download) }
+        if pair.mode == .copy {
+            Button("Sync Once…") { ReviewWindow.show(pair.id, kind: .syncOnce) }
+        }
+        if model.supportsHiddenCleanup(pair) {
+            Button("Old Hidden Files…") { HiddenFilesWindow.show(pair.id) }
+        }
+        Divider()
+        Button("Show in Finder") {
+            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: pair.localPath)
+        }
+        if showsEdit {
+            Button("Edit…") { SettingsWindow.show(select: pair.id) }
+        }
     }
 }

@@ -9,12 +9,15 @@ Wasabi, Google Drive, SFTP…).
 ## Features
 
 - **Folder → bucket pairs**, each with its own settings.
+- **Dashboard**: the app window opens on an overview of every folder, with status, progress, quick
+  actions and totals (Liquid Glass on macOS 26).
 - **Copy or Sync mode**
   - **Copy** (default): only adds and updates files in the bucket. Deleting a file locally never
     deletes it remotely.
   - **Sync**: the bucket mirrors the folder, so local deletions are removed from the bucket too. On B2,
     removed files are kept as hidden versions until your lifecycle rules purge them.
-- **One-off actions**, from the **⋯** menu on each folder. Both open a review window first, and nothing
+- **One-off actions**, from the **⋯** menu on each folder (menu bar or dashboard) or the folder's
+  **Actions** section in the app. Both open a review window first, and nothing
   changes until you confirm.
   - **Download from cloud…**: copies the files that are only in the bucket into the folder, e.g. to
     review and clean them. Files already in the folder are never overwritten, and nothing is deleted.
@@ -43,7 +46,7 @@ Wasabi, Google Drive, SFTP…).
 
 ## Usage
 
-1. Open Bucketwatch. Its icon shows up in the menu bar.
+1. Open Bucketwatch. Its icon shows up in the menu bar; **Dashboard** there opens the app window.
 2. **Settings… → +**, choose a local folder and a destination:
    - **Backblaze B2**: Key ID, application key and bucket. Create a key that is restricted to that
      bucket, with read and write access.

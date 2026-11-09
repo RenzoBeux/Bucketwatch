@@ -7,6 +7,7 @@ import SwiftUI
 import WidgetKit
 
 enum SidebarItem: Hashable {
+    case dashboard
     case pair(UUID)
     case general
 }
@@ -152,7 +153,7 @@ final class AppModel: ObservableObject {
         calls[id]?.cancel()
         Keychain.set("", for: id.uuidString)
         config.pairs.removeAll { $0.id == id }
-        if selection == .pair(id) { selection = config.pairs.first.map { .pair($0.id) } ?? .general }
+        if selection == .pair(id) { selection = .dashboard }
     }
 
     // MARK: Overlap
@@ -761,7 +762,7 @@ final class AppModel: ObservableObject {
         case "download": if let id { ReviewWindow.show(id, kind: .download) }
         case "sync-once": if let id { ReviewWindow.show(id, kind: .syncOnce) }
         case "hidden": if let id { HiddenFilesWindow.show(id) }
-        default: SettingsWindow.show(select: id)
+        default: if let id { SettingsWindow.show(select: id) } else { SettingsWindow.showDashboard() }
         }
     }
 }
